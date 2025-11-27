@@ -1,0 +1,11 @@
+# Core Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.1
+pydantic>=2.6.4
+python-dotenv>=1.0.1
+python-multipart
+python-dateutil
+# AI and Data Processing
+openai>=1.12.0
+PyMuPDF>=1.23.23  # Required for 'fitz' functions: reading PDF and converting to images
+Pillow>=10.2.0    # Required as 'PIL' for image manipulation (converting to bytes/base64)
