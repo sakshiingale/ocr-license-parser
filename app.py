@@ -1,61 +1,68 @@
-# api.py
 import os
 import json
 import fitz  # PyMuPDF
-import logging
-import base64
-import tempfile
-import re
-import datetime
-from io import BytesIO
-from PIL import Image
+import openai
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import tempfile
+import logging
+import base64
+from io import BytesIO
+from PIL import Image
 from pydantic import BaseModel
-from typing import Optional, Union
-from dateutil.parser import parse
+from typing import Optional, Union 
 import uvicorn
+import re 
+import datetime # Kept for date parsing in calculation helpers
+from dateutil.parser import parse # Kept for date parsing in calculation helpers
 
-# OpenAI client
-from openai import OpenAI
-
-# Load env
+# Load Azure OpenAI credentials
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # change if you want gpt-4o-mini or gpt-4o-mini-preview, etc.
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
-if not OPENAI_API_KEY:
-    logging.warning("OPENAI_API_KEY not set. Make sure to export OPENAI_API_KEY in your environment.")
+# --- GENERIC CERTIFICATE Data Models ---
 
-# Create OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# --- Data models ---
 class ExtractedCertificateFields(BaseModel):
+    """Internal model for data extracted directly by the Vision API."""
     license_number: Optional[str] = None
     license_title: Optional[str] = None
     start_date: Optional[str] = None
     expiry_date: Optional[str] = None
     IsPermanent: Optional[bool] = None
     cost: Optional[Union[str, int]] = None
-
+    
 class FinalCertificateResponse(BaseModel):
-    license_number: str = "NA"
+    """
+    The final response schema matching your internal screen/database schema,
+    without calculated date fields.
+    """
+    # Extracted fields, defaulted to 'NA' if None
+    license_number: str = "NA" 
     license_title: str = "NA"
     start_date: str = "NA"
     expiry_date: Optional[str] = "NA"
     IsPermanent: Optional[bool] = False
-    cost: Optional[Union[str, int]] = "NA"
-    application_days: Optional[int] = 0
+    cost: Optional[Union[str, int]] = "NA" 
+    
+    # --- Compliance/Internal Fields ---
+    application_days: Optional[int] = 0 # Retained as 0 as requested
     upload_file: Optional[bool] = True
     file_number: Optional[str] = "NA"
     physical_location: Optional[str] = "NA"
 
-# --- Helpers ---
+# --- Calculation Functions (Kept but not used in final mapping) ---
+# We keep these definitions because they are referenced in the helper functions, 
+# but the main endpoint no longer uses their results.
+
 def calculate_days_remaining(expiry_date_str: str) -> Optional[int]:
+    """Calculates the number of days remaining between the expiry date and today."""
     if not expiry_date_str or expiry_date_str == "NA" or expiry_date_str.upper() == "NULL":
         return None
+        
     try:
         expiry_date = parse(expiry_date_str).date()
         today = datetime.date.today()
@@ -65,7 +72,13 @@ def calculate_days_remaining(expiry_date_str: str) -> Optional[int]:
         logging.error(f"[DAYS REMAINING ERROR] Could not parse date '{expiry_date_str}': {e}")
         return None
 
+        
+# --- Helper Functions (Standard) ---
+
 def pdf_validator(pdf_path, password=None):
+    """
+    Extracts text for error checking (password/integrity) and regex fallback.
+    """
     logging.info(f"[INFO] Extracting text from PDF (for validation/regex only): {pdf_path}")
     text = []
     doc = None
@@ -75,11 +88,12 @@ def pdf_validator(pdf_path, password=None):
             text.append(page.get_text())
         return "\n".join(text)
     except Exception as e:
-        if doc and getattr(doc, "needs_pass", False):
+        if doc and doc.needs_pass:
             raise RuntimeError('PDF is password protected. Authentication failed.')
         raise RuntimeError(f"PDF validation failed: {e}")
 
 def pdf_to_images(pdf_path, dpi=200):
+    """Converts ALL pages of the PDF file to a list of PIL Images."""
     logging.info(f"[INFO] Converting ALL PDF pages to images at {dpi} DPI.")
     images = []
     try:
@@ -96,8 +110,9 @@ def pdf_to_images(pdf_path, dpi=200):
         return []
 
 def extract_license_number_from_text(text):
+    """Extracts a generic certificate number using regex patterns."""
     patterns = [
-        r'(?:License\s*No\.?\s*:?\s*|Certificate\s*No\.?\s*:?\s*|Reg\s*No\.?\s*:?\s*)([A-Z0-9\-\/]{5,30})',
+        r'(?:License\s*No\.?\s*:?\s*|Certificate\s*No\.?\s*:?\s*|Reg\s*No\.?\s*:?\s*)([A-Z0-9\-\/]{5,30})', 
         r'(\b[A-Z0-9]{5,15}\d{4,}\b)'
     ]
     for pattern in patterns:
@@ -107,114 +122,108 @@ def extract_license_number_from_text(text):
             return match.group(1)
     return None
 
-# --- Vision & OpenAI interaction (now using OpenAI API Key) ---
-def process_image_with_openai(images: list):
-    """
-    Convert images to base64 data URIs and send them as part of a user message to the OpenAI chat model.
-    The model is instructed to return a single JSON object containing the requested fields.
-    Note: some OpenAI models accept images directly as structured message content; here we embed base64
-    data URIs in the message text so it's robust against client library differences.
-    """
-    if not OPENAI_API_KEY:
-        logging.error("Missing OPENAI_API_KEY for Vision.")
+# --- Vision Functions (Core Logic) ---
+
+def process_image_with_vision(images: list):
+    if not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT or not AZURE_OPENAI_API_VERSION:
+        logging.error("Missing Azure OpenAI credentials for Vision.")
         return None
-
+        
     try:
-        # Prepare a combined user content: system prompt + the images as inline data URIs
-        system_prompt = """
-You are a data extraction specialist. Analyze the certificate image(s) and extract the following information in JSON format:
-
-- license_number: The primary certificate, license, or registration number (Extract EXACTLY as seen).
-- license_title: The official, specific, non-generic title of the license/certificate.
-- start_date: The date of issuance or start date (YYYY-MM-DD format if possible).
-- expiry_date: The date until which the certificate is valid (YYYY-MM-DD format if possible, or null if permanent).
-- IsPermanent: True if the certificate has no expiry date, otherwise false.
-- cost: Return the license or registration fee paid (e.g., "2000 INR", "Rs. 6000").
-
-Consolidate data from ALL pages. If a field is not found, return null. Return ONLY valid JSON (a single top-level JSON object) with no extra text.
-"""
-
-        # Build a long user string: short instruction plus each image inserted as "Image N: data:<mime>;base64,<b64>"
-        image_texts = []
+        user_content_list = []
+        
         for i, image in enumerate(images):
             buffered = BytesIO()
             image.save(buffered, format="PNG", optimize=True)
             b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
             data_uri = f"data:image/png;base64,{b64}"
-            # include a small label for each image; the model will see the data URI
-            image_texts.append(f"--- IMAGE PAGE {i+1} START ---\n{data_uri}\n--- IMAGE PAGE {i+1} END ---")
+            user_content_list.append({"type": "image_url", "image_url": {"url": data_uri}})
 
-        user_message = "Analyze the following images (each included as a base64 data URI). Consolidate into one JSON object.\n\n" + "\n\n".join(image_texts)
-
+        user_content_list.insert(0, {
+            "type": "text", 
+            "text": "Analyze all pages of the document. Extract the details for the **most important/primary license or certificate** and consolidate all requested fields into a single JSON object."
+        })
+        
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ]
+            {
+                "role": "system",
+                "content": """
+You are a data extraction specialist. Analyze the certificate image(s) and extract the following information in JSON format:
 
-        # Use the OpenAI client chat completions API
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
+- license_number: The primary certificate, license, or registration number (Extract EXACTLY as seen).
+
+- license_title: Extract the **true regulatory license/certificate type** based on the actual purpose, authority, and nature of permission granted in the document — NOT the decorative heading printed on top.
+  
+  • DO NOT return generic headings such as "Registration Certificate", "Certificate", "Order", "Form", "Verification", "Environmental Clearance (Cover Page)", "Certificate of Authorization", etc., even if they appear in large/bold text.  
+  • Instead, infer the specific license type exactly the way it appears in the expected label list or Identify the exact nature of the permission/approval being granted (e.g., *Biomedical Waste Registration*, *Environmental Clearance*, *Factory License*, *PESO Petroleum Storage License*, *DG Set Registration*, *Labour License*, *Legal Metrology – Verification*, etc.).  
+  • Derive the title from regulatory clues such as the issuing department, applicable acts/rules, type of permission (e.g., storage, operation, generator, hazardous material, labour registration, factory registration), category/class, or license purpose.
+  • If the text is in a regional language, translate the **meaningful regulatory license type**, not the literal header wording and return in english.
+  • The final title must reflect the **actual type of government approval** represented by the document, not its layout heading.  
+  • Only return the regulatory license name. If no meaningful license type can be determined, return null.
+
+- start_date: The date of issuance or start date (YYYY-MM-DD format if possible).
+
+- expiry_date: The date until which the certificate is valid (YYYY-MM-DD format if possible, or null if permanent).
+
+- IsPermanent: True if the certificate has no expiry date, otherwise false.
+
+- cost: Return the license or registration fee paid (e.g., "2000 INR", "Rs. 6000").
+
+CRITICAL INSTRUCTIONS:
+Consolidate data from ALL pages. 
+If a field is not found, use null. 
+Extract the EXACT license_number. 
+Return ONLY valid JSON with no extra text.
+
+"""
+
+            
+            },
+            {
+                "role": "user",
+                "content": user_content_list,
+            }
+        ]
+        
+        client = openai.AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        )
+        
+        response = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
             messages=messages,
             max_tokens=1000,
-            temperature=0.05
+            temperature=0.1
         )
-
-        # Extract content string (works with the modern client response shape)
-        content = None
-        # Safe access to nested response structure:
-        try:
-            # older/newer client shapes: prefer first choice -> message -> content
-            choices = getattr(resp, "choices", None) or resp.get("choices", None)
-            if choices and len(choices) > 0:
-                first = choices[0]
-                # different SDK shapes:
-                if isinstance(first, dict):
-                    # dict-like
-                    content = first.get("message", {}).get("content")
-                else:
-                    # object-like
-                    content = getattr(first, "message", None)
-                    if content:
-                        content = getattr(content, "get", lambda k, default=None: None)("content", None)
-        except Exception:
-            # fallback: try resp.output_text or str(resp)
-            content = getattr(resp, "output_text", None) or str(resp)
-
-        if not content:
-            # Try other fallback fields
-            content = str(resp)
-
-        content = content.strip()
-        logging.info(f"[DEBUG] OpenAI Vision Raw Response (truncated): {content[:300]}...")
+        
+        content = response.choices[0].message.content.strip()
+        logging.info(f"[DEBUG] Vision Raw Response: {content[:100]}...")
         return content
-
+        
     except Exception as e:
-        logging.error(f"[ERROR] OpenAI Vision API call failed: {e}", exc_info=True)
+        logging.error(f"[ERROR] Vision API call failed: {e}")
         return None
 
-def extract_fields_with_openai(pdf_path):
+def extract_fields_with_vision(pdf_path):
     images = pdf_to_images(pdf_path)
     if not images:
         return None
-
-    first_result = process_image_with_openai(images)
+    
+    first_result = process_image_with_vision(images)
     if not first_result:
         return None
-
+        
     try:
         cleaned_content = first_result.strip()
         json_match = re.search(r'\{.*\}', cleaned_content, re.DOTALL)
         if not json_match:
-            # Could be newline-delimited or wrapped; attempt a more lenient extraction
-            try:
-                parsed = json.loads(cleaned_content)
-                parsed_data = parsed
-            except Exception:
-                logging.error(f"[ERROR] OpenAI response did not contain a direct JSON object: {cleaned_content[:200]}...")
-                return None
-        else:
-            parsed_data = json.loads(json_match.group(0))
-
+            logging.error(f"[ERROR] Vision response did not contain a valid JSON object: {cleaned_content[:50]}...")
+            return None
+            
+        parsed_data = json.loads(json_match.group(0))
+   
         mapped_data = {
             'license_number': parsed_data.get('license_number'),
             'license_title': parsed_data.get('license_title'),
@@ -223,27 +232,28 @@ def extract_fields_with_openai(pdf_path):
             'IsPermanent': parsed_data.get('IsPermanent', False),
             'cost': parsed_data.get('cost')
         }
-
-        if mapped_data.get('IsPermanent') in [True, 'true', 'True', 'TRUE']:
+        
+        # Final IsPermanent Logic Check (handle boolean conversion)
+        if mapped_data.get('IsPermanent') in [True, 'true', 'True']:
             mapped_data['IsPermanent'] = True
             mapped_data['expiry_date'] = None
         else:
             mapped_data['IsPermanent'] = False
-
+        
         return ExtractedCertificateFields(**mapped_data).model_dump()
-
+            
     except json.JSONDecodeError as e:
-        logging.error(f"[ERROR] Failed to parse OpenAI result as JSON: {e}")
+        logging.error(f"[ERROR] Failed to parse vision result as JSON: {e}")
         return None
     except Exception as e:
-        logging.error(f"[ERROR] OpenAI-based extraction failed: {e}", exc_info=True)
+        logging.error(f"[ERROR] Vision-based extraction failed: {e}")
         return None
 
-# --- FastAPI App ---
-app = FastAPI(title="Generic Certificate Extractor API (OpenAI)", version="1.0.0")
+# --- FastAPI App and Endpoint ---
+app = FastAPI(title="Generic Certificate Extractor API", version="1.0.0")
 
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
     allow_methods=["*"], allow_headers=["*"],
 )
 
@@ -251,65 +261,72 @@ app.add_middleware(
 async def api_extract_fields(pdf: UploadFile = File(...)):
     if not pdf.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
-
+    
     content = await pdf.read()
     pdf_path = None
-
+    
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
             pdf_path = tmp.name
             tmp.write(content)
 
-        text = pdf_validator(pdf_path)
-
-        logging.info("Executing OpenAI model for image-based extraction.")
-        fields = extract_fields_with_openai(pdf_path)
-
-        # Regex fallback for license number if not extracted
+        # 1. Extract Text (Used only for final Regex fallback)
+        text = pdf_validator(pdf_path) 
+        
+        # 2. VISION MODEL PRIMARY EXECUTION
+        logging.info("Executing Vision Model for image-based extraction.")
+        fields = extract_fields_with_vision(pdf_path) 
+        
+        # 3. Final Regex check on text 
         if fields and not fields.get('license_number'):
             fields['license_number'] = extract_license_number_from_text(text)
-
-        extracted_expiry_date = fields.get('expiry_date') if fields else None
-
+        renewal_days = FinalCertificateResponse.model_fields['application_days'].default
+        extracted_expiry_date = fields.get('expiry_date')
+        
+        # 4. Map Extracted Fields to Final Schema
+        
         final_data = FinalCertificateResponse(
-            license_number=fields.get('license_number') if fields else "NA",
-            license_title=fields.get('license_title') if fields else "NA",
-            start_date=fields.get('start_date') if fields else "NA",
-            expiry_date=extracted_expiry_date if fields else "NA",
-            IsPermanent=fields.get('IsPermanent') if fields else False,
-            cost=fields.get('cost') if fields else "NA",
-            application_days=calculate_days_remaining(extracted_expiry_date) if extracted_expiry_date else 0,
+            license_number=fields.get('license_number'),
+            license_title=fields.get('license_title'),
+            start_date=fields.get('start_date'),
+            expiry_date=extracted_expiry_date,
+            IsPermanent=fields.get('IsPermanent'),
+            cost=fields.get('cost'),
+            application_days=calculate_days_remaining(extracted_expiry_date),
             upload_file=True,
             file_number="NA",
             physical_location="NA",
         )
-
+        
+        # 5. Return the final, complete structure
         return final_data
-
+        
     except RuntimeError as e:
-        logging.error(f"[FATAL] PDF Runtime Error: {e}")
+        logging.error(f"[FATAL] PDF Runtime Error: {e}") 
         raise HTTPException(status_code=400, detail=f'The PDF could not be processed: {str(e)}')
     except Exception as e:
         logging.error(f"[FATAL] Unexpected Error: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f'An unexpected error occurred: {str(e)}')
-
     finally:
         if pdf_path and os.path.exists(pdf_path):
             os.unlink(pdf_path)
 
 @app.get("/")
 async def root():
+    """Root endpoint with API information"""
     return {
-        "message": "Generic Certificate Extractor API (OpenAI)",
+        "message": "Generic Certificate Extractor API (Vision Only)",
         "version": "1.0.0",
         "endpoint": "/api/extract-fields",
     }
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint"""
     return {"status": "healthy"}
 
-if __name__ == '__main__':
+
+if '__main__' == __name__:
     logging.basicConfig(level=logging.INFO)
     port = int(os.environ.get('PORT', 8000))
     uvicorn.run(app, host='0.0.0.0', port=port)
